@@ -1,0 +1,5 @@
+<resources>
+    <style name="Theme.Souchastnik" parent="Theme.AppCompat.DayNight">
+        <item name="colorAccent">#C0392B</item>
+    </style>
+</resources>

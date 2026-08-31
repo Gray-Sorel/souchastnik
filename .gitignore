@@ -1,0 +1,35 @@
+.gradle/
+build/
+local.properties
+.idea/
+*.iml
+.cxx/
+third_party/
+
+# Веса модели в git не едут. Как собрать релизный APK -- см.
+# app/src/main/jniLibs/README.md
+app/src/main/jniLibs/arm64-v8a/*.so
+!app/src/main/jniLibs/arm64-v8a/.gitkeep
+*.gguf
+*.imatrix
+
+# Артефакты обучения
+train/out/
+train/data/*.jsonl
+
+# Локальные примеры фраз для tools/try.py.
+# Дословные оскорбления в публичном репозитории -- лишний риск для автора,
+# поэтому промпту они подкладываются локально.
+tools/examples.local.json
+
+# Не для публичного репозитория: заметки, замеры, обучение, демо.
+# Всё это живёт локально.
+docs/
+train/
+tools/try.py
+tools/desktop_probe.py
+tools/run_bench.sh
+
+# Python
+__pycache__/
+*.pyc

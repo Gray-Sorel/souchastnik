@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+      РАЗРЕШЕНИЙ НЕТ. НАМЕРЕННО.
+
+      В частности, здесь нет android.permission.INTERNET.
+      Это не обещание в политике конфиденциальности, а проверяемый факт:
+      приложение технически не способно отправить наружу ни один байт.
+      Для клавиатуры, которая по определению видит пароли и переписку,
+      это единственная допустимая позиция.
+
+      Если в этом файле однажды появится INTERNET -- это баг или атака.
+      Проверить в собранном APK:  aapt dump permissions app-release.apk
+    -->
+
+    <application
+        android:allowBackup="false"
+        android:extractNativeLibs="true"
+        android:label="@string/app_name"
+        android:supportsRtl="false"
+        android:theme="@style/Theme.Souchastnik">
+
+        <service
+            android:name=".ime.SouchastnikIME"
+            android:exported="true"
+            android:label="@string/ime_name"
+            android:permission="android.permission.BIND_INPUT_METHOD">
+            <intent-filter>
+                <action android:name="android.view.InputMethod" />
+            </intent-filter>
+            <meta-data
+                android:name="android.view.im"
+                android:resource="@xml/method" />
+        </service>
+
+        <!--
+          Движок живёт в ОТДЕЛЬНОМ процессе.
+          Клавиатура не имеет права умирать: если IME убьют по OOM,
+          пользователь останется без ввода во всей системе.
+          Модель на ~700 МБ RSS сидит здесь; убили этот процесс --
+          строка просто погасла, клавиатура продолжает работать.
+        -->
+        <service
+            android:name=".engine.EngineService"
+            android:exported="false"
+            android:process=":engine" />
+
+        <activity
+            android:name=".ime.SetupActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!--
+          Замер латентности на устройстве. Запуск:
+            adb shell am start -n dev.souchastnik/.engine.BenchActivity
+            adb logcat -s souchastnik-bench:I souchastnik-native:I
+        -->
+        <activity
+            android:name=".engine.BenchActivity"
+            android:exported="true"
+            android:label="Bench" />
+
+    </application>
+</manifest>
