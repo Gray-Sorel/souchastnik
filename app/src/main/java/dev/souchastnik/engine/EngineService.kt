@@ -33,8 +33,7 @@ class EngineService : Service() {
         /** Коды ответа [IEngine.load], описаны в IEngine.aidl. */
         const val LOAD_OK = 0
         const val LOAD_NO_MODEL = 1
-        const val LOAD_UNSUPPORTED_CPU = 2
-        const val LOAD_INIT_FAILED = 3
+        const val LOAD_INIT_FAILED = 2
     }
 
     // Один поток: генерации строго по одной. Параллелить нечего — модель
@@ -53,21 +52,18 @@ class EngineService : Service() {
                 Log.w(TAG, "модель не установлена: ${model.absolutePath}")
                 return LOAD_NO_MODEL
             }
-            // ДО первого обращения к LlamaBridge: его init{} грузит
-            // libsouchastnik.so со всеми зависимостями, а libggml-cpu собрана
-            // под dotprod+fp16 и на старом ядре может упасть по SIGILL уже
-            // при загрузке. Падение процесса :engine клавиатуру не убьёт, но
-            // строка навсегда останется в «…» без объяснений.
-            if (!Cpu.supported()) {
-                Log.w(TAG, "процессор без dotprod/fp16, модель не запускаем")
-                return LOAD_UNSUPPORTED_CPU
-            }
             Articles.load(this@EngineService)
             Triggers.load(this@EngineService)
 
+            // Без dotprod (Kirin 710, Snapdragon 680...) ggml возьмёт вариант
+            // armv8.0 и разбор пойдёт в разы медленнее. Работать будет.
+            if (!Cpu.hasDotprod()) Log.w(TAG, "процессор без dotprod: медленный путь")
+
             val t0 = System.currentTimeMillis()
-            handle = LlamaBridge.init(model.absolutePath, Cpu.threadCount())
-            Log.i(TAG, "load: handle=$handle за ${System.currentTimeMillis() - t0} мс")
+            handle = LlamaBridge.init(
+                model.absolutePath, applicationInfo.nativeLibraryDir, Cpu.threadCount())
+            Log.i(TAG, "load: handle=$handle, ggml-cpu=${LlamaBridge.backendName()} " +
+                "за ${System.currentTimeMillis() - t0} мс")
             return if (handle != 0L) LOAD_OK else LOAD_INIT_FAILED
         }
 

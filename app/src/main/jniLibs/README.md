@@ -2,9 +2,13 @@
 
 В этой папке должен лежать файл
 
-    arm64-v8a/libmodel-qwen35-08b-q4km.so
+    arm64-v8a/libmodel-qwen35-08b-q40.so
 
-Это не библиотека. Это GGUF-файл модели, переименованный.
+Это не библиотека. Это GGUF-файл модели, переименованный. Квант — Q4_0,
+не Q4_K_M: на ARM с dotprod у Q4_0 есть «repack»-ядра, префилл быстрее в
+1,3–1,9 раза при том же качестве (замер в `docs/DESIGN.md`). Квантовать
+надо из f16 напрямую: переквантованный из Q4_K_M файл теряет точность
+вдвое. Имя файла задано в `LlamaBridge.MODEL_LIB`.
 
 ## Зачем так
 
@@ -24,15 +28,25 @@
 рудимент, а условие работоспособности. При `false` библиотеки читаются
 страницами прямо из APK и файла на диске не существует.
 
+## Соседи по каталогу: варианты ядер ggml
+
+Рядом с моделью в `nativeLibraryDir` окажутся семь файлов
+`libggml-cpu-android_<arch>.so` — от `armv8.0_1` (без dotprod, для
+Cortex-A53/A73) до `armv9.2_2` (i8mm, SVE, SME). Они НЕ лежат в этой папке:
+их собирает CMake (`GGML_CPU_ALL_VARIANTS` в `build.gradle.kts`), а мост при
+`init` выбирает подходящий процессору по `ggml_backend_score()` и грузит
+через `ggml_backend_load` (`load_cpu_backend()` в `llama_bridge.cpp`). Имя
+файла — контракт: префикс `libggml-cpu-` и суффикс `.so`.
+
 ## Откуда взять файл
 
 Для спайка (замер скорости, обучение не нужно):
 
 ```bash
-huggingface-cli download bartowski/Qwen_Qwen3.5-0.8B-GGUF \
-    Qwen_Qwen3.5-0.8B-Q4_K_M.gguf --local-dir build/
-cp build/Qwen_Qwen3.5-0.8B-Q4_K_M.gguf \
-   app/src/main/jniLibs/arm64-v8a/libmodel-qwen35-08b-q4km.so
+huggingface-cli download unsloth/Qwen3.5-0.8B-GGUF \
+    Qwen3.5-0.8B-Q4_0.gguf --local-dir build/
+cp build/Qwen3.5-0.8B-Q4_0.gguf \
+   app/src/main/jniLibs/arm64-v8a/libmodel-qwen35-08b-q40.so
 ```
 
 Для релиза — своя дообученная, через `bash tools/make_gguf.sh`.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Сборка GGUF для телефона: merge LoRA -> f16 GGUF -> imatrix -> Q4_K_M.
+# Сборка GGUF для телефона: merge LoRA -> f16 GGUF -> imatrix -> Q4_0.
 #
 # Нужны llama.cpp и питон с transformers/peft.
 #   bash tools/make_gguf.sh path/to/lora-adapter
@@ -53,14 +53,14 @@ fi
     -o "$WORK/souchastnik.imatrix" \
     --chunks 200
 
-echo "== 4/4 квантизация Q4_K_M =="
+echo "== 4/4 квантизация Q4_0 (на ARM с dotprod у Q4_0 есть repack-ядра, у K-квантов нет; см. LlamaBridge.MODEL_LIB) =="
 "$LLAMA/build/bin/llama-quantize" \
     --imatrix "$WORK/souchastnik.imatrix" \
     "$WORK/souchastnik-f16.gguf" \
-    "$WORK/libmodel-qwen35-08b-q4km.so" \
-    Q4_K_M
+    "$WORK/libmodel-qwen35-08b-q40.so" \
+    Q4_0
 
-ls -la "$WORK/libmodel-qwen35-08b-q4km.so"
+ls -la "$WORK/libmodel-qwen35-08b-q40.so"
 echo
 echo "Готово. Расширение .so -- не ошибка: файл кладётся в"
 echo "app/src/main/jniLibs/arm64-v8a/ и устанавливается системой"

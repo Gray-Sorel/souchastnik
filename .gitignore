@@ -6,6 +6,13 @@ local.properties
 .cxx/
 third_party/
 
+# Релизный ключ и пароли к нему. Потеря этого файла = потеря возможности
+# обновлять уже установленное приложение: Android не примет APK, подписанный
+# другим ключом. Хранить вне репозитория и в бэкапе.
+keystore.properties
+*.jks
+*.keystore
+
 # Веса модели в git не едут. Как собрать релизный APK -- см.
 # app/src/main/jniLibs/README.md
 app/src/main/jniLibs/arm64-v8a/*.so
@@ -33,3 +40,11 @@ tools/run_bench.sh
 # Python
 __pycache__/
 *.pyc
+
+# Ассеты целиком в репозиторий не идут: дословные оскорбления и промпты
+# публиковать под своим именем — лишний риск. В APK файлы попадают.
+app/src/main/assets/
+
+# Контрольный набор и скрипт сравнения вариантов: дословные фразы, локально.
+tools/testset.local.json
+tools/bench_variants.py

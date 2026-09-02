@@ -49,8 +49,16 @@ object LlamaBridge {
      */
     const val NONE_BIAS = 1.0f
 
-    /** @return хендл движка, 0 — ошибка */
-    external fun init(modelPath: String, nThreads: Int): Long
+    /**
+     * @param libDir `applicationInfo.nativeLibraryDir`: здесь лежат варианты
+     *   ядер `libggml-cpu-android_*.so`, из которых мост выберет подходящий
+     *   процессору (см. `load_cpu_backend` в llama_bridge.cpp).
+     * @return хендл движка, 0 — ошибка (в т. ч. ни один вариант не подошёл)
+     */
+    external fun init(modelPath: String, libDir: String, nThreads: Int): Long
+
+    /** Имя выбранного варианта ядер, например `android_armv8.2_2`; "" до init. */
+    external fun backendName(): String
 
     /**
      * Разбирает одно сообщение и выбирает вариант из [alts].

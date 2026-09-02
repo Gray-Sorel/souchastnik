@@ -86,10 +86,7 @@ class BenchActivity : Activity() {
         log("примеры в промпте: ${if (dev.souchastnik.data.Examples.isEmpty()) "НЕТ" else "есть"}")
 
         log("cpu features: ${Cpu.features()?.sorted()?.joinToString(" ") ?: "/proc/cpuinfo недоступен"}")
-        if (!Cpu.supported()) {
-            log("ПРОЦЕССОР БЕЗ dotprod/fp16 — ggml собран под них, модель не запускаем")
-            return
-        }
+        if (!Cpu.hasDotprod()) log("без dotprod: ggml возьмёт вариант armv8.0, будет медленно")
 
         // Число потоков можно задать снаружи, чтобы сравнивать без пересборки:
         //   adb shell am start -n dev.souchastnik/.engine.BenchActivity --ei threads 2
@@ -97,13 +94,20 @@ class BenchActivity : Activity() {
         val threads = intent?.getIntExtra("threads", 0)?.takeIf { it > 0 } ?: Cpu.threadCount()
         log("потоков: $threads")
 
+        // Пауза между фразами в секундах — имитация набора с перерывами на
+        // телефонах с 3–4 ГБ RAM: вытесняет ли система страницы mmap модели,
+        // пока человек думает (тогда фраза после паузы заметно дольше):
+        //   adb shell am start -n dev.souchastnik/.engine.BenchActivity --ei pause 30
+        val pauseSec = intent?.getIntExtra("pause", 0) ?: 0
+        if (pauseSec > 0) log("пауза между фразами: $pauseSec с")
+
         val t0 = System.currentTimeMillis()
-        val h = LlamaBridge.init(model.absolutePath, threads)
+        val h = LlamaBridge.init(model.absolutePath, applicationInfo.nativeLibraryDir, threads)
         if (h == 0L) {
             log("init ПРОВАЛИЛСЯ — смотри logcat souchastnik-native")
             return
         }
-        log("загрузка: ${System.currentTimeMillis() - t0} мс")
+        log("загрузка: ${System.currentTimeMillis() - t0} мс, ggml-cpu: ${LlamaBridge.backendName()}")
 
         val cacheOk = LlamaBridge.probeStateCache(h, "${cacheDir.absolutePath}/state.bin")
         log("prompt cache: ${if (cacheOk) "РАБОТАЕТ" else "НЕ РАБОТАЕТ"}")
@@ -127,6 +131,7 @@ class BenchActivity : Activity() {
         val cases = intent?.getStringExtra("phrase")?.let { listOf(it to "?") } ?: CASES
 
         for ((text, want) in cases) {
+            if (pauseSec > 0) Thread.sleep(pauseSec * 1000L)
             val stats = LongArray(4)
             var promptTokens = 0L
             var ms = 0L

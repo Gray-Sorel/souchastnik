@@ -4,45 +4,36 @@ import android.util.Log
 import java.io.File
 
 /**
- * Что за процессор под нами. Читается из /proc и /sys без единой строчки
- * нативного кода — намеренно: libggml-cpu собрана с
- * `-march=armv8.2-a+dotprod+fp16` (см. app/build.gradle.kts), и на ядре без
- * этих инструкций уже её загрузка может кончиться SIGILL. Поэтому решать,
- * трогать ли [LlamaBridge] вообще, надо ДО `System.loadLibrary`.
+ * Что за процессор под нами: справка для логов и настроек и выбор числа
+ * потоков. Читается из /proc и /sys без нативного кода.
  *
- * Обращаться к `LlamaBridge.MODEL_LIB` при этом можно: это `const val`,
- * компилятор подставляет строку по месту, объект не инициализируется.
+ * Какие инструкции использовать, решает не этот класс: ggml собран во всех
+ * вариантах под arm64 (GGML_CPU_ALL_VARIANTS, см. build.gradle.kts), и мост
+ * выбирает подходящий вариант по HWCAP в `load_cpu_backend()`. Здесь только
+ * предупреждение о медленном пути.
  */
 object Cpu {
 
     private const val TAG = "souchastnik-cpu"
 
     /**
-     * Флаги из строки `Features` в /proc/cpuinfo, которых требует сборка.
-     * dotprod — `asimddp`; fp16 — пара `fphp` (скаляры) и `asimdhp`
-     * (вектора), ggml проверяет обе. Имена те же, что у HWCAP в ядре Linux.
-     */
-    private val REQUIRED = listOf("asimddp", "fphp", "asimdhp")
-
-    /**
-     * Есть ли у процессора инструкции, под которые собран ggml.
+     * Есть ли dotprod (`asimddp` в строке `Features` /proc/cpuinfo; имя то же,
+     * что у HWCAP_ASIMDDP в ядре Linux).
      *
-     * Нет их у всего на Cortex-A53/A57/A72/A73 (armv8.0): Snapdragon 680/685,
-     * 662/665, Helio G25/G35, Exynos 7870/7884, Kirin 970 и старше. Это
-     * по-прежнему заметная часть парка бюджетных телефонов. Ядра A55/A75 и
-     * новее (2018+) всё это умеют.
+     * С ним ядра Q4_0 идут через «repack»-путь и на Dimensity 700 префиллят
+     * ~73 т/с; без него ggml берёт вариант armv8.0 и на том же телефоне было
+     * ~11 т/с — разбор фразы с промптом судьи в ~300 токенов растягивается на
+     * десятки секунд. Без dotprod всё на Cortex-A53/A57/A72/A73: Kirin 710/970
+     * (Honor 8X/9X, P30 Lite), Snapdragon 680/685, 662/665, Helio G25/G35,
+     * Exynos 7870/7884. Ядра A55/A75 и новее (2018+) dotprod умеют.
      *
-     * Если /proc/cpuinfo не читается — считаем, что можно: лучше редкий
-     * SIGILL на экзотической прошивке, чем отключённая модель у всех, кому
-     * вендор закрыл procfs.
+     * Если /proc/cpuinfo не читается — считаем, что есть: это только справка.
      */
-    fun supported(): Boolean {
+    fun hasDotprod(): Boolean {
         val feats = features() ?: return true
-        val missing = REQUIRED.filterNot { it in feats }
-        if (missing.isNotEmpty()) {
-            Log.w(TAG, "процессору не хватает: $missing; есть: $feats")
-        }
-        return missing.isEmpty()
+        val has = "asimddp" in feats
+        if (!has) Log.w(TAG, "процессор без dotprod; есть: $feats")
+        return has
     }
 
     /**
@@ -88,8 +79,9 @@ object Cpu {
      *   - большие едва быстрее маленьких (Helio G85: 2×A75@2,0 + 6×A55@1,8)
      *     — по частоте разница 10%, а по IPC двукратная.
      *
-     * Однородные ядра (8×A55 на Unisoc) — кластер один, и тогда по числу
-     * ядер: 8 → 4, 4 → 2. Если sysfs не читается — так же.
+     * Kirin 710F (4×A73@2,2 + 4×A53@1,7) даёт 4. Однородные ядра (8×A55 на
+     * Unisoc) — кластер один, и тогда по числу ядер: 8 → 4, 4 → 2. Если sysfs
+     * не читается — так же.
      */
     fun threadCount(): Int {
         val n = Runtime.getRuntime().availableProcessors()

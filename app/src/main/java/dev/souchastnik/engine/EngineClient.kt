@@ -33,8 +33,6 @@ class EngineClient(private val ctx: Context) {
 
     sealed interface State {
         object NoModel : State
-        /** Процессор без dotprod/fp16: модель на этом телефоне не запускаем. */
-        object Unsupported : State
         object Loading : State
         object Clean : State
         object Thinking : State
@@ -48,6 +46,22 @@ class EngineClient(private val ctx: Context) {
     private var nextId = 1L
     private var lastSent: String? = null
 
+    /** `load()` ещё идёт. Пока true, ответ `not_loaded` — не ошибка, а «рано». */
+    private var loading = false
+
+    /**
+     * Текст, который успел уйти в движок до конца загрузки модели и вернулся
+     * с `not_loaded`. Отправляется повторно, как только `load()` завершится.
+     *
+     * Без этого первая фраза после появления клавиатуры терялась: разбор
+     * уходит через 600 мс дебаунса, загрузка модели длится 2 с на Dimensity
+     * 700 и 4 с на Kirin 710F, а тот же текст клиент второй раз не шлёт
+     * (защита от дребезга по `lastSent`). Человек видел «чисто» на фразе с
+     * явным составом, пока не нажимал ещё одну клавишу. Воспроизведено на
+     * Honor 9X 2026-09-02: SMS с готовым текстом → тап в поле → «чисто».
+     */
+    private var pending: String? = null
+
     private val callback = object : IEngineCallback.Stub() {
         override fun onVerdict(requestId: Long, code: String?, latencyMs: Long) {
             if (requestId != nextId - 1) return  // пока считали, человек напечатал ещё
@@ -60,7 +74,16 @@ class EngineClient(private val ctx: Context) {
         }
 
         override fun onError(requestId: Long, message: String?) {
-            if (message == "not_loaded") main.post { onState?.invoke(State.NoModel) }
+            if (message == "not_loaded") main.post {
+                if (loading) {
+                    // Модель ещё грузится: запомнить текст и дослать после load().
+                    pending = lastSent
+                    lastSent = null
+                    onState?.invoke(State.Loading)
+                } else {
+                    onState?.invoke(State.NoModel)
+                }
+            }
             // "aborted" — это норма: человек продолжил печатать. Строку не трогаем.
         }
     }
@@ -69,6 +92,7 @@ class EngineClient(private val ctx: Context) {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
             val e = IEngine.Stub.asInterface(binder)
             engine = e
+            loading = true
             onState?.invoke(State.Loading)
             // load() читает с диска пол гига — не на главном потоке.
             Thread {
@@ -77,18 +101,27 @@ class EngineClient(private val ctx: Context) {
                 } catch (t: Throwable) {
                     Log.e(TAG, "load упал", t); EngineService.LOAD_INIT_FAILED
                 }
-                val state = when (code) {
-                    EngineService.LOAD_OK -> State.Clean
-                    EngineService.LOAD_UNSUPPORTED_CPU -> State.Unsupported
-                    else -> State.NoModel
+                main.post {
+                    loading = false
+                    if (code != EngineService.LOAD_OK) {
+                        pending = null
+                        onState?.invoke(State.NoModel)
+                        return@post
+                    }
+                    // Текст, который пришёл раньше модели, — досылаем сразу,
+                    // без дебаунса: пауза уже была.
+                    val p = pending
+                    pending = null
+                    if (p != null && engine === e) send(e, p) else onState?.invoke(State.Clean)
                 }
-                main.post { onState?.invoke(state) }
             }.start()
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
             // Процесс :engine убили по памяти. Клавиатура жива, строка гаснет.
             engine = null
+            loading = false
+            pending = null
             main.post { onState?.invoke(State.NoModel) }
         }
     }
@@ -118,6 +151,8 @@ class EngineClient(private val ctx: Context) {
         }
         engine = null
         lastSent = null
+        loading = false
+        pending = null
     }
 
     /** Вызывается на каждое нажатие клавиши. */
@@ -146,14 +181,17 @@ class EngineClient(private val ctx: Context) {
             return
         }
 
-        main.postDelayed({
-            lastSent = trimmed
-            onState?.invoke(State.Thinking)
-            try {
-                e.analyze(trimmed, nextId++, callback)
-            } catch (t: Throwable) {
-                Log.e(TAG, "analyze упал", t)
-            }
-        }, DEBOUNCE_MS)
+        main.postDelayed({ send(e, trimmed) }, DEBOUNCE_MS)
+    }
+
+    /** Отправить текст в движок. Только с главного потока. */
+    private fun send(e: IEngine, text: String) {
+        lastSent = text
+        onState?.invoke(State.Thinking)
+        try {
+            e.analyze(text, nextId++, callback)
+        } catch (t: Throwable) {
+            Log.e(TAG, "analyze упал", t)
+        }
     }
 }

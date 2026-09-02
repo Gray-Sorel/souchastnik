@@ -33,6 +33,8 @@
 
 #include <jni.h>
 #include <android/log.h>
+#include <dirent.h>
+#include <dlfcn.h>
 
 #include <algorithm>
 #include <atomic>
@@ -41,6 +43,7 @@
 #include <string>
 #include <vector>
 
+#include "ggml-backend.h"
 #include "llama.h"
 
 #define TAG "souchastnik-native"
@@ -97,6 +100,82 @@ std::string jstr(JNIEnv * env, jstring s) {
     std::string out = c ? c : "";
     env->ReleaseStringUTFChars(s, c);
     return out;
+}
+
+// Имя загруженного варианта ggml-cpu ("android_armv8.2_2"); пусто, пока не
+// загружен. Бэкенд один на процесс, поэтому статик, а не поле Engine.
+std::string g_cpu_backend;
+
+// Выбирает и грузит вариант ядер ggml-cpu под этот процессор.
+//
+// ggml собран с GGML_BACKEND_DL + GGML_CPU_ALL_VARIANTS (build.gradle.kts):
+// рядом с libsouchastnik.so лежат семь libggml-cpu-android_<arch>.so, от
+// armv8.0 без dotprod до armv9.2 с SME. У каждого есть ggml_backend_score():
+// 0 -- этому CPU не подходит (проверяется по getauxval(AT_HWCAP), сам вызов
+// безопасен на любом ядре), иначе -- чем богаче набор инструкций, тем выше.
+//
+// Не ggml_backend_load_all_from_path(): та сканирует каталог по разу на
+// каждый из пятнадцати бэкендов (CUDA, Vulkan, ...) и не говорит, что в итоге
+// выбрала. Нам нужно имя варианта в лог и в бенч: именно оно объясняет,
+// почему на Kirin 710 разбор идёт 20+ секунд, а на Dimensity 700 -- 4.
+//
+// Зависимость libggml-base.so вариантам dlopen находит среди уже
+// загруженных: её притащил System.loadLibrary("souchastnik").
+//
+// @return имя варианта без префикса/суффикса или пустая строка при провале.
+std::string load_cpu_backend(const std::string & dir) {
+    const std::string prefix = "libggml-cpu-";
+    const std::string suffix = ".so";
+
+    DIR * d = opendir(dir.c_str());
+    if (!d) {
+        LOGE("каталог библиотек не открывается: %s", dir.c_str());
+        return std::string();
+    }
+
+    int         best_score = 0;
+    std::string best_path;
+    std::string best_name;
+    int         seen = 0;
+
+    while (dirent * ent = readdir(d)) {
+        const std::string name = ent->d_name;
+        if (name.size() <= prefix.size() + suffix.size()) continue;
+        if (name.compare(0, prefix.size(), prefix) != 0) continue;
+        if (name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) continue;
+        ++seen;
+
+        const std::string path = dir + "/" + name;
+        void * h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (!h) {
+            LOGE("dlopen %s: %s", name.c_str(), dlerror());
+            continue;
+        }
+        auto score_fn = reinterpret_cast<int (*)()>(dlsym(h, "ggml_backend_score"));
+        const int score = score_fn ? score_fn() : -1;
+        dlclose(h);
+        LOGI("вариант ggml-cpu %s: score %d", name.c_str(), score);
+
+        if (score > best_score) {
+            best_score = score;
+            best_path  = path;
+            best_name  = name.substr(prefix.size(),
+                                     name.size() - prefix.size() - suffix.size());
+        }
+    }
+    closedir(d);
+
+    if (best_score <= 0) {
+        LOGE("ни один вариант ggml-cpu не подходит этому CPU (файлов %d в %s)",
+             seen, dir.c_str());
+        return std::string();
+    }
+    if (!ggml_backend_load(best_path.c_str())) {
+        LOGE("ggml_backend_load(%s) не удался", best_path.c_str());
+        return std::string();
+    }
+    LOGI("ggml-cpu: %s (score %d)", best_name.c_str(), best_score);
+    return best_name;
 }
 
 std::vector<llama_token> tokenize(const llama_vocab * vocab,
@@ -299,10 +378,19 @@ extern "C" {
 
 JNIEXPORT jlong JNICALL
 Java_dev_souchastnik_engine_LlamaBridge_init(JNIEnv * env, jobject,
-                                            jstring jmodel, jint n_threads) {
+                                            jstring jmodel, jstring jlib_dir,
+                                            jint n_threads) {
+    // Бэкенд поднимается один раз на процесс. Сначала вариант ggml-cpu,
+    // потом llama_backend_init: без загруженного CPU-бэкенда модель не
+    // загрузится, и ошибка была бы невнятной ("no backends").
     static std::atomic<bool> backend_ready{false};
     if (!backend_ready.exchange(true)) {
+        g_cpu_backend = load_cpu_backend(jstr(env, jlib_dir));
         llama_backend_init();
+    }
+    if (g_cpu_backend.empty()) {
+        LOGE("движок не поднят: нет варианта ggml-cpu под этот процессор");
+        return 0;
     }
 
     Engine * e = new Engine();
@@ -341,9 +429,15 @@ Java_dev_souchastnik_engine_LlamaBridge_init(JNIEnv * env, jobject,
         return 0;
     }
 
-    LOGI("движок готов: n_ctx %d, потоков %d, eos %d",
-         N_CTX, (int) n_threads, (int) e->eos);
+    LOGI("движок готов: ggml-cpu %s, n_ctx %d, потоков %d, eos %d",
+         g_cpu_backend.c_str(), N_CTX, (int) n_threads, (int) e->eos);
     return reinterpret_cast<jlong>(e);
+}
+
+/** Имя варианта ядер ggml-cpu, выбранного под этот процессор; "" до init. */
+JNIEXPORT jstring JNICALL
+Java_dev_souchastnik_engine_LlamaBridge_backendName(JNIEnv * env, jobject) {
+    return env->NewStringUTF(g_cpu_backend.c_str());
 }
 
 /**

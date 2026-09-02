@@ -7,6 +7,4 @@
     <string name="strip_off">Соучастник выключен</string>
     <string name="strip_clean">чисто</string>
     <string name="strip_thinking">…</string>
-    <string name="strip_no_model">модель не установлена</string>
-    <string name="strip_unsupported">процессор этого телефона модель не потянет</string>
-</resources>
+    <string name="strip_no_model">модель не установлена</string></resources>

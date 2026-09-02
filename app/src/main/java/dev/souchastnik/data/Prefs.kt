@@ -14,11 +14,13 @@ object Prefs {
     private const val KEY_ENABLED = "enabled"
 
     /**
-     * Выключено при первой установке. Намеренно: человек сначала видит,
-     * что клавиатура просто работает как клавиатура, и включает шутку сам.
+     * Включено при первой установке: человек поставил именно эту клавиатуру,
+     * и ждать от него ещё одного тумблера незачем -- строка должна работать
+     * сразу. Модель поднимается при первом открытии клавиатуры; кому она не
+     * нужна, выключает шутку тумблером на экране настройки или в самой строке.
      */
     fun isEnabled(ctx: Context): Boolean =
-        prefs(ctx).getBoolean(KEY_ENABLED, false)
+        prefs(ctx).getBoolean(KEY_ENABLED, true)
 
     fun setEnabled(ctx: Context, value: Boolean) {
         prefs(ctx).edit().putBoolean(KEY_ENABLED, value).apply()
