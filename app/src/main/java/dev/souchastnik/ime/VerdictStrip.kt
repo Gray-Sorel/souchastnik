@@ -64,6 +64,10 @@ class VerdictStrip(context: Context) : LinearLayout(context) {
                 label.setTextColor(colorClean)
                 label.text = context.getString(R.string.strip_no_model)
             }
+            EngineClient.State.Unsupported -> {
+                label.setTextColor(colorClean)
+                label.text = context.getString(R.string.strip_unsupported)
+            }
             EngineClient.State.Loading -> {
                 label.setTextColor(colorClean)
                 label.text = "…"

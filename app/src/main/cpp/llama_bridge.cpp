@@ -1,27 +1,40 @@
 // Соучастник -- нативный мост к llama.cpp.
 //
-// Задача узкая: получить строку, которую человек печатает, и вернуть индекс
-// одной статьи из закрытого перечня.
+// Задача узкая: получить строку, которую человек печатает, и выбрать ОДИН
+// вариант из закрытого списка (код статьи-кандидата либо "none").
 //
 // ПОЧЕМУ НЕ GBNF-ГРАММАТИКА. Первая версия зажимала вывод грамматикой на
-// перечень кодов ("5.61" | "158" | ...). Замер на десктопе
-// (x64, 4 потока) показал:
+// перечень кодов ("5.61" | "158" | ...). Замер на десктопе (x64, 4 потока):
 //
 //     без грамматики          sampling =   2.3 мс
 //     грамматика, 1 токен     sampling = 325.8 мс
 //     грамматика, 3 токена    sampling = 571.9 мс
 //
 // Грамматический сэмплер обходит весь словарь -- у Qwen3.5 это 248 320
-// токенов -- на каждом шаге. Инструмент, введённый ради скорости, оказался
-// в сто раз дороже самого вывода, и на ARM было бы ещё хуже.
+// токенов -- на каждом шаге. Для закрытого списка из нескольких строк это
+// лишнее: варианты можно токенизировать заранее и на каждом шаге брать
+// argmax только по тем токенам, которыми хоть один живой вариант может
+// продолжиться. Это десяток сравнений вместо четверти миллиона, результат
+// тот же, что у грамматики с жадным сэмплингом.
 //
-// Поэтому каждая статья обозначена ОДНИМ токеном (метка в articles.json).
-// Нужен один шаг префилла, дальше argmax по 83 значениям логитов --
-// это микросекунды, и никакого сэмплера в проекте больше нет.
+// ПОЧЕМУ НЕ ОДНОТОКЕННЫЕ МЕТКИ. Предыдущая ревизия обозначала каждую статью
+// одним символом и делала argmax по 83 логитам за один проход префилла --
+// быстро, но проверялось это только на десктопе через tools/try.py
+// --mode prod, где и записано: без обученной LoRA режим выдаёт мусор.
+// Замер на устройстве это подтвердил: модель на каждой фразе выдавала '<',
+// то есть первый символ '<think>', которым Qwen3.5 начинает ЛЮБОЙ ответ.
+// Метку '<' носит статья 280.4, поэтому мусор выглядел как вердикт.
+//
+// ОТСЮДА ГЛАВНОЕ: Qwen3.5 -- инструктивная гибридная reasoning-модель, и
+// сырым промптом её дёргать нельзя. Промпт обязан идти через чат-шаблон,
+// причём с ЗАКРЫТЫМ блоком рассуждения: шаблон из GGUF при
+// enable_thinking=false дописывает "<think>\n\n</think>\n\n" после реплики
+// ассистента. Без этого ответы схлопываются в одну статью на всё.
 
 #include <jni.h>
 #include <android/log.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -43,19 +56,30 @@ long ms_since(steady::time_point t0) {
         steady::now() - t0).count();
 }
 
-// Контекст держим крошечным. У модели заявлено 262K, нам нужно ~200:
-// системный промпт плюс одно сообщение. Каждый лишний токен n_ctx --
-// это байты состояния, которые мы платим из бюджета RSS.
-constexpr int N_CTX = 512;
+// Системное сообщение судьи -- это таблица статей-кандидатов плюс инструкции,
+// у калитки свой промпт на два десятка строк. Прежние 512 на это не влезают.
+// Цена -- байты состояния из бюджета RSS, поэтому не больше, чем нужно.
+constexpr int N_CTX = 1024;
+
+// Сколько токенов оставляем под ответ и служебные хвосты при обрезке.
+constexpr int N_RESERVE = 16;
+
+// Куски чат-шаблона Qwen3.5 (tokenizer.chat_template в GGUF), развёрнутые
+// для случая "system + user, add_generation_prompt=true, enable_thinking=false".
+// Развёрнуты руками намеренно: тянуть в APK Jinja-движок ради двух сообщений
+// незачем, а llama_chat_apply_template из C API не принимает
+// chat_template_kwargs и открытый <think> не закроет.
+constexpr const char * TPL_SYS_OPEN  = "<|im_start|>system\n";
+constexpr const char * TPL_SYS_CLOSE = "<|im_end|>\n<|im_start|>user\n";
+constexpr const char * TPL_TAIL      =
+    "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
 
 struct Engine {
     llama_model   * model = nullptr;
     llama_context * ctx   = nullptr;
     const llama_vocab * vocab = nullptr;
 
-    std::vector<llama_token> sys_tokens;
-    // Токены меток, по индексам: 0 -- "чисто", дальше статьи.
-    std::vector<llama_token> label_tokens;
+    llama_token eos = 0;
 
     // Выставляется из cancel() и читается abort-колбэком llama.cpp:
     // пользователь нажал следующую клавишу -- текущий разбор не нужен.
@@ -76,10 +100,11 @@ std::string jstr(JNIEnv * env, jstring s) {
 }
 
 std::vector<llama_token> tokenize(const llama_vocab * vocab,
-                                 const std::string & text,
-                                 bool add_special) {
+                                  const std::string & text,
+                                  bool add_special) {
     int n = -llama_tokenize(vocab, text.c_str(), (int32_t) text.size(),
                             nullptr, 0, add_special, /*parse_special*/ true);
+    if (n <= 0) return std::vector<llama_token>();
     std::vector<llama_token> out(n);
     int got = llama_tokenize(vocab, text.c_str(), (int32_t) text.size(),
                              out.data(), n, add_special, true);
@@ -97,81 +122,175 @@ void reset_state(Engine * e) {
     llama_memory_clear(llama_get_memory(e->ctx), /*data*/ true);
 }
 
-// Один проход: префилл системного промпта и сообщения, затем argmax
-// по логитам меток. Возвращает индекс метки, -1 при ошибке или отмене.
+struct Stats {
+    long prompt_tokens = 0;
+    long prefill_ms    = 0;
+    long decode_ms     = 0;
+    long gen_tokens    = 0;
+};
+
+// Один разбор: собрать промпт по чат-шаблону, префиллить и выбрать один
+// вариант из alts. Возвращает индекс выбранного варианта, -1 при ошибке
+// или отмене.
 //
-// Здесь реализован ПЛАН Б: системный промпт префиллится заново на каждый
-// запрос. Это дёшево ровно потому, что assets/prompt.txt короткий (~8
-// токенов). План А -- переиспользование сохранённого состояния -- включаем
-// только если сохранение состояния окажется рабочим: у Qwen3.5 вместо
-// KV-кэша рекуррентное состояние DeltaNet-слоёв, и оно отматывается
-// лишь до грубой контрольной точки -- переиспользовать удаётся около
-// половины промпта, что для восьми токенов системной части не стоит
-// усложнения.
+// Варианты сравниваются пожадному, токен за токеном: на каждом шаге
+// разрешены только те токены, которыми продолжается хотя бы один ещё живой
+// вариант. Если какой-то вариант уже выбран целиком, к разрешённым
+// добавляется признак конца -- иначе на списке вида {"207", "207.3"}
+// короткий вариант был бы недостижим.
 //
-// candidates -- индексы меток от словаря триггеров (Triggers.kt). argmax
-// берётся только по ним плюс индекс 0 ("чисто"). Пустой список означает
-// "по всем": так работает bench, а клиент до этого не доводит -- если
-// триггеры молчат, модель не запускается вообще.
-int run(Engine * e, const std::string & text,
-        const std::vector<int> & candidates,
-        long * out_prefill = nullptr,
-        long * out_pick    = nullptr) {
+// first_bias прибавляется к логиту первого токена alts[0] на первом шаге.
+// alts[0] -- это "none", и сдвиг задаёт порог «чисто»: при коротком списке
+// кандидатов модель охотнее берёт статью, чем отвечает none, а пропущенная
+// статья для шутки безвредна, ложная выглядит как поломка. Значение и
+// таблица замеров -- у NONE_BIAS в LlamaBridge.kt. Это тот же argmax, что и
+// раньше, просто с гирей на одной чаше: ни одного лишнего прохода модели
+// сдвиг не стоит.
+int decide(Engine * e,
+           const std::string & system,
+           const std::string & text,
+           const std::vector<std::string> & alts,
+           float first_bias,
+           Stats * st) {
+    if (alts.empty()) return -1;
+
     e->abort_flag.store(false);
     reset_state(e);
 
-    // Формат запроса. Обучение адаптера должно использовать ровно этот же
-    // формат, причём системная часть и сообщение токенизируются РАЗДЕЛЬНО:
-    // при склейке в одну строку BPE может слить токены через границу, и
-    // адаптер увидит в бою не тот формат, что при обучении.
-    std::string user = "<msg>" + text + "</msg>\n";
+    // Токенизируем кусками: между ними стоят спецтокены чат-шаблона, так что
+    // BPE не сольёт токены через границу, а обрезать длинное сообщение можно
+    // не трогая системную часть.
+    const std::vector<llama_token> head =
+        tokenize(e->vocab, std::string(TPL_SYS_OPEN) + system + TPL_SYS_CLOSE,
+                 /*add_special*/ false);
+    const std::vector<llama_token> tail =
+        tokenize(e->vocab, TPL_TAIL, /*add_special*/ false);
+    std::vector<llama_token> body = tokenize(e->vocab, text, /*add_special*/ false);
 
-    std::vector<llama_token> toks = e->sys_tokens;
-    std::vector<llama_token> u = tokenize(e->vocab, user, /*add_special*/ false);
-    toks.insert(toks.end(), u.begin(), u.end());
-
-    if ((int) toks.size() >= N_CTX - 1) {
-        // Человек пишет простыню -- берём хвост, там обычно и состав.
-        int keep = N_CTX - 1 - (int) e->sys_tokens.size() - 1;
-        if (keep < 8) return -1;
-        std::vector<llama_token> tail(toks.end() - keep, toks.end());
-        toks = e->sys_tokens;
-        toks.insert(toks.end(), tail.begin(), tail.end());
+    if (head.empty() || tail.empty()) {
+        LOGE("чат-шаблон не токенизировался");
+        return -1;
     }
+
+    const int budget = N_CTX - N_RESERVE - (int) head.size() - (int) tail.size();
+    if (budget < 8) {
+        LOGE("системное сообщение не влезает в контекст: %d токенов при N_CTX=%d",
+             (int) head.size(), N_CTX);
+        return -1;
+    }
+    if ((int) body.size() > budget) {
+        // Человек пишет простыню -- берём хвост, там обычно и состав.
+        body.erase(body.begin(), body.end() - budget);
+    }
+
+    std::vector<llama_token> toks = head;
+    toks.insert(toks.end(), body.begin(), body.end());
+    toks.insert(toks.end(), tail.begin(), tail.end());
+
+    if (st) st->prompt_tokens = (long) toks.size();
 
     steady::time_point t0 = steady::now();
     llama_batch batch = llama_batch_get_one(toks.data(), (int32_t) toks.size());
     if (llama_decode(e->ctx, batch) != 0) {
-        LOGE("prefill failed");
+        // Отмена через abort-колбэк тоже приходит сюда как ненулевой код:
+        // человек нажал следующую клавишу, это штатно, а не ошибка.
+        if (e->abort_flag.load(std::memory_order_relaxed)) {
+            LOGI("разбор отменён на префилле (%d токенов)", (int) toks.size());
+        } else {
+            LOGE("префилл не прошёл (%d токенов)", (int) toks.size());
+        }
         return -1;
     }
-    if (out_prefill) *out_prefill = ms_since(t0);
-
+    if (st) st->prefill_ms = ms_since(t0);
     if (e->abort_flag.load(std::memory_order_relaxed)) return -1;
 
-    steady::time_point t1 = steady::now();
-    const float * logits = llama_get_logits_ith(e->ctx, -1);
-    if (!logits) return -1;
-
-    // Индекс 0 -- "чисто", он в выборе всегда: иначе модели некуда ответить
-    // "состава нет", и она обязана назвать статью.
-    int best = 0;
-    float best_logit = logits[e->label_tokens[0]];
-
-    if (candidates.empty()) {
-        for (size_t i = 1; i < e->label_tokens.size(); ++i) {
-            const float l = logits[e->label_tokens[i]];
-            if (l > best_logit) { best_logit = l; best = (int) i; }
-        }
-    } else {
-        for (int idx : candidates) {
-            if (idx <= 0 || idx >= (int) e->label_tokens.size()) continue;
-            const float l = logits[e->label_tokens[idx]];
-            if (l > best_logit) { best_logit = l; best = idx; }
+    // Заранее разложенные варианты. Пустая токенизация означала бы вариант,
+    // который модель не может произнести -- честнее упасть, чем молча его
+    // никогда не выбирать.
+    std::vector<std::vector<llama_token>> alt_toks(alts.size());
+    for (size_t i = 0; i < alts.size(); ++i) {
+        alt_toks[i] = tokenize(e->vocab, alts[i], /*add_special*/ false);
+        if (alt_toks[i].empty()) {
+            LOGE("вариант \"%s\" не токенизировался", alts[i].c_str());
+            return -1;
         }
     }
-    if (out_pick) *out_pick = ms_since(t1);
-    return best;
+
+    std::vector<int> alive(alts.size());
+    for (size_t i = 0; i < alts.size(); ++i) alive[i] = (int) i;
+
+    steady::time_point t1 = steady::now();
+    size_t pos = 0;
+    int chosen = -1;
+
+    while (true) {
+        if (e->abort_flag.load(std::memory_order_relaxed)) return -1;
+
+        const float * logits = llama_get_logits_ith(e->ctx, -1);
+        if (!logits) return -1;
+
+        // Разрешённые продолжения и признак того, что какой-то вариант уже
+        // набран целиком.
+        std::vector<llama_token> allowed;
+        bool complete = false;
+        for (int i : alive) {
+            if (pos < alt_toks[i].size()) {
+                const llama_token t = alt_toks[i][pos];
+                if (std::find(allowed.begin(), allowed.end(), t) == allowed.end()) {
+                    allowed.push_back(t);
+                }
+            } else {
+                complete = true;
+            }
+        }
+        if (allowed.empty()) break;   // всё живое уже набрано целиком
+
+        // Сдвиг порога действует только на первом шаге и только на первый
+        // токен alts[0]: дальше выбор идёт уже внутри статей-кандидатов.
+        const llama_token biased = (pos == 0) ? alt_toks[0][0] : -1;
+        auto score = [&](llama_token t) -> float {
+            return logits[t] + (t == biased ? first_bias : 0.0f);
+        };
+
+        llama_token best = allowed[0];
+        float best_logit = score(allowed[0]);
+        for (size_t k = 1; k < allowed.size(); ++k) {
+            const float l = score(allowed[k]);
+            if (l > best_logit) { best_logit = l; best = allowed[k]; }
+        }
+
+        // Модель хочет закончить, и заканчивать есть чем.
+        if (complete && logits[e->eos] > best_logit) break;
+
+        std::vector<int> next;
+        for (int i : alive) {
+            if (pos < alt_toks[i].size() && alt_toks[i][pos] == best) next.push_back(i);
+        }
+        if (next.empty()) break;      // сюда попасть нельзя, но пусть
+        alive.swap(next);
+        ++pos;
+        if (st) st->gen_tokens = (long) pos;
+
+        // Остался один вариант и он набран целиком -- лишний проход не нужен.
+        if (alive.size() == 1 && pos == alt_toks[alive[0]].size()) {
+            chosen = alive[0];
+            break;
+        }
+
+        llama_batch b = llama_batch_get_one(&best, 1);
+        if (llama_decode(e->ctx, b) != 0) {
+            LOGE("декод не прошёл на шаге %d", (int) pos);
+            return -1;
+        }
+    }
+
+    if (chosen < 0) {
+        for (int i : alive) {
+            if (alt_toks[i].size() == pos) { chosen = i; break; }
+        }
+    }
+    if (st) st->decode_ms = ms_since(t1);
+    return chosen;
 }
 
 } // namespace
@@ -180,8 +299,7 @@ extern "C" {
 
 JNIEXPORT jlong JNICALL
 Java_dev_souchastnik_engine_LlamaBridge_init(JNIEnv * env, jobject,
-                                            jstring jmodel, jstring jlabels,
-                                            jstring jsystem, jint n_threads) {
+                                            jstring jmodel, jint n_threads) {
     static std::atomic<bool> backend_ready{false};
     if (!backend_ready.exchange(true)) {
         llama_backend_init();
@@ -189,12 +307,12 @@ Java_dev_souchastnik_engine_LlamaBridge_init(JNIEnv * env, jobject,
 
     Engine * e = new Engine();
     const std::string model_path = jstr(env, jmodel);
-    const std::string labels     = jstr(env, jlabels);
-    const std::string system     = jstr(env, jsystem);
 
     llama_model_params mp = llama_model_default_params();
-    mp.use_mmap  = true;   // модель лежит распакованной в nativeLibraryDir
-    mp.use_mlock = false;  // на телефоне лочить 500 МБ нельзя
+    // В этой ревизии llama.cpp use_mmap/use_mlock заменены полем load_mode:
+    // модель лежит распакованной в nativeLibraryDir, mmap без mlock -- лочить
+    // 500 МБ на телефоне нельзя.
+    mp.load_mode = LLAMA_LOAD_MODE_MMAP;
     mp.n_gpu_layers = 0;   // CPU. Vulkan-бэкенд для DeltaNet-ops пока лотерея,
                            // включать только после замеров на устройстве
 
@@ -205,6 +323,7 @@ Java_dev_souchastnik_engine_LlamaBridge_init(JNIEnv * env, jobject,
         return 0;
     }
     e->vocab = llama_model_get_vocab(e->model);
+    e->eos   = llama_vocab_eos(e->vocab);
 
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx           = N_CTX;
@@ -222,46 +341,45 @@ Java_dev_souchastnik_engine_LlamaBridge_init(JNIEnv * env, jobject,
         return 0;
     }
 
-    // Каждая метка ОБЯЗАНА быть одним токеном -- на этом стоит весь
-    // расчёт. Если словарь модели сменился и метка распалась на два
-    // токена, честнее упасть здесь, чем молча выдавать чужие статьи.
-    for (char c : labels) {
-        std::vector<llama_token> t = tokenize(e->vocab, std::string(1, c),
-                                              /*add_special*/ false);
-        if (t.size() != 1) {
-            LOGE("метка '%c' не однотокенная (%d токенов) -- проверь алфавит "
-                 "меток в articles.json против словаря модели", c, (int) t.size());
-            llama_free(e->ctx);
-            llama_model_free(e->model);
-            delete e;
-            return 0;
-        }
-        e->label_tokens.push_back(t[0]);
-    }
-
-    e->sys_tokens = tokenize(e->vocab, system, /*add_special*/ true);
-    LOGI("движок готов: системный промпт %d токенов, меток %d, потоков %d",
-         (int) e->sys_tokens.size(), (int) e->label_tokens.size(), (int) n_threads);
-
+    LOGI("движок готов: n_ctx %d, потоков %d, eos %d",
+         N_CTX, (int) n_threads, (int) e->eos);
     return reinterpret_cast<jlong>(e);
 }
 
+/**
+ * @return индекс выбранного варианта в alts, -1 при ошибке или отмене.
+ *   noneBias -- сдвиг порога «чисто», см. decide().
+ *   jstats, если передан, заполняется как
+ *   [промпт в токенах, префилл мс, декод мс, сгенерировано токенов].
+ */
 JNIEXPORT jint JNICALL
-Java_dev_souchastnik_engine_LlamaBridge_analyze(JNIEnv * env, jobject,
-                                                jlong handle, jstring jtext,
-                                                jintArray jcandidates) {
+Java_dev_souchastnik_engine_LlamaBridge_decide(JNIEnv * env, jobject,
+                                               jlong handle, jstring jsystem,
+                                               jstring jtext, jobjectArray jalts,
+                                               jfloat noneBias,
+                                               jlongArray jstats) {
     Engine * e = reinterpret_cast<Engine *>(handle);
-    if (!e) return -1;
+    if (!e || !jalts) return -1;
 
-    std::vector<int> candidates;
-    if (jcandidates) {
-        const jsize n = env->GetArrayLength(jcandidates);
-        candidates.resize(n);
-        if (n > 0) {
-            env->GetIntArrayRegion(jcandidates, 0, n, candidates.data());
-        }
+    const jsize n = env->GetArrayLength(jalts);
+    std::vector<std::string> alts;
+    alts.reserve(n);
+    for (jsize i = 0; i < n; ++i) {
+        jstring s = (jstring) env->GetObjectArrayElement(jalts, i);
+        alts.push_back(jstr(env, s));
+        env->DeleteLocalRef(s);
     }
-    return run(e, jstr(env, jtext), candidates);
+
+    Stats st;
+    const int idx = decide(e, jstr(env, jsystem), jstr(env, jtext), alts,
+                           (float) noneBias, &st);
+
+    if (jstats && env->GetArrayLength(jstats) >= 4) {
+        jlong vals[4] = { (jlong) st.prompt_tokens, (jlong) st.prefill_ms,
+                          (jlong) st.decode_ms,     (jlong) st.gen_tokens };
+        env->SetLongArrayRegion(jstats, 0, 4, vals);
+    }
+    return idx;
 }
 
 JNIEXPORT void JNICALL
@@ -284,31 +402,36 @@ Java_dev_souchastnik_engine_LlamaBridge_free(JNIEnv *, jobject, jlong handle) {
 
 JNIEXPORT jboolean JNICALL
 Java_dev_souchastnik_engine_LlamaBridge_probeStateCache(JNIEnv * env, jobject,
-                                                       jlong handle, jstring jpath) {
+                                                        jlong handle, jstring jpath) {
     Engine * e = reinterpret_cast<Engine *>(handle);
     if (!e) return JNI_FALSE;
     const std::string path = jstr(env, jpath);
 
+    // Проверяем на куске, который в бою и будет общим префиксом всех
+    // запросов, -- на открытии системной реплики.
+    const std::vector<llama_token> probe =
+        tokenize(e->vocab, TPL_SYS_OPEN, /*add_special*/ false);
+    if (probe.empty()) return JNI_FALSE;
+
     reset_state(e);
-    llama_batch b = llama_batch_get_one(e->sys_tokens.data(),
-                                        (int32_t) e->sys_tokens.size());
+    llama_batch b = llama_batch_get_one(const_cast<llama_token *>(probe.data()),
+                                        (int32_t) probe.size());
     if (llama_decode(e->ctx, b) != 0) return JNI_FALSE;
 
     size_t written = llama_state_seq_save_file(e->ctx, path.c_str(), 0,
-                                               e->sys_tokens.data(),
-                                               e->sys_tokens.size());
+                                               probe.data(), probe.size());
     if (written == 0) {
         LOGE("state_seq_save вернул 0 -- сохранение состояния не поддержано");
         return JNI_FALSE;
     }
 
     reset_state(e);
-    std::vector<llama_token> restored(e->sys_tokens.size());
+    std::vector<llama_token> restored(probe.size());
     size_t n_restored = 0;
     size_t read = llama_state_seq_load_file(e->ctx, path.c_str(), 0,
                                             restored.data(), restored.size(),
                                             &n_restored);
-    if (read == 0 || n_restored != e->sys_tokens.size()) {
+    if (read == 0 || n_restored != probe.size()) {
         LOGE("state_seq_load не восстановил состояние (read=%d n=%d)",
              (int) read, (int) n_restored);
         return JNI_FALSE;
@@ -316,22 +439,6 @@ Java_dev_souchastnik_engine_LlamaBridge_probeStateCache(JNIEnv * env, jobject,
     LOGI("prompt cache работает: %d байт, %d токенов",
          (int) written, (int) n_restored);
     return JNI_TRUE;
-}
-
-JNIEXPORT jlongArray JNICALL
-Java_dev_souchastnik_engine_LlamaBridge_benchOnce(JNIEnv * env, jobject,
-                                                  jlong handle, jstring jtext) {
-    Engine * e = reinterpret_cast<Engine *>(handle);
-    jlongArray res = env->NewLongArray(3);
-    if (!e) return res;
-
-    long prefill = 0, pick = 0;
-    // Bench смотрит на модель без словаря: сколько она стоит сама по себе.
-    int index = run(e, jstr(env, jtext), std::vector<int>(), &prefill, &pick);
-
-    jlong vals[3] = { (jlong) prefill, (jlong) pick, (jlong) index };
-    env->SetLongArrayRegion(res, 0, 3, vals);
-    return res;
 }
 
 } // extern "C"

@@ -33,6 +33,8 @@ class EngineClient(private val ctx: Context) {
 
     sealed interface State {
         object NoModel : State
+        /** Процессор без dotprod/fp16: модель на этом телефоне не запускаем. */
+        object Unsupported : State
         object Loading : State
         object Clean : State
         object Thinking : State
@@ -70,12 +72,17 @@ class EngineClient(private val ctx: Context) {
             onState?.invoke(State.Loading)
             // load() читает с диска пол гига — не на главном потоке.
             Thread {
-                val ok = try {
+                val code = try {
                     e.load()
                 } catch (t: Throwable) {
-                    Log.e(TAG, "load упал", t); false
+                    Log.e(TAG, "load упал", t); EngineService.LOAD_INIT_FAILED
                 }
-                main.post { onState?.invoke(if (ok) State.Clean else State.NoModel) }
+                val state = when (code) {
+                    EngineService.LOAD_OK -> State.Clean
+                    EngineService.LOAD_UNSUPPORTED_CPU -> State.Unsupported
+                    else -> State.NoModel
+                }
+                main.post { onState?.invoke(state) }
             }.start()
         }
 
@@ -89,10 +96,15 @@ class EngineClient(private val ctx: Context) {
     fun connect() {
         if (engine != null) return
         Articles.load(ctx)
+        // BIND_IMPORTANT: процесс :engine получает приоритет клавиатуры, а
+        // не фонового процесса. Иначе на телефонах с раздельными cpuset
+        // (у Dimensity 700 фон = только четыре A55) модель уедет на
+        // маленькие ядра: замер на BenchActivity под заблокированным
+        // экраном — 18 с на фразу вместо 7 на больших ядрах.
         ctx.bindService(
             Intent(ctx, EngineService::class.java),
             conn,
-            Context.BIND_AUTO_CREATE,
+            Context.BIND_AUTO_CREATE or Context.BIND_IMPORTANT,
         )
     }
 

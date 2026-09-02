@@ -91,7 +91,10 @@ class SetupActivity : AppCompatActivity() {
         val model = EngineService.modelFile(this)
         status.text = buildString {
             append("Статей в справочнике: ${Articles.size()}\n")
-            if (model.exists()) {
+            if (!dev.souchastnik.engine.Cpu.supported()) {
+                append("Процессор без dotprod/fp16 — модель на этом телефоне не запустится,\n")
+                append("строка будет пустой.\n")
+            } else if (model.exists()) {
                 append("Модель: ${model.length() / 1024 / 1024} МБ\n")
             } else {
                 append("Модель не установлена — строка будет пустой.\n")

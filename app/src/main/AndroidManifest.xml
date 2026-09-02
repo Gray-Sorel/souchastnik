@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <!--
       РАЗРЕШЕНИЙ НЕТ. НАМЕРЕННО.
@@ -10,9 +11,23 @@
       Для клавиатуры, которая по определению видит пароли и переписку,
       это единственная допустимая позиция.
 
-      Если в этом файле однажды появится INTERNET -- это баг или атака.
+      Если в этом файле однажды появится INTERNET — это баг или атака.
       Проверить в собранном APK:  aapt dump permissions app-release.apk
     -->
+
+    <!--
+      androidx.core безусловно добавляет в свой манифест самоадресованное
+      разрешение DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION — служебное,
+      для ContextCompat.registerReceiver на API меньше 33, которым этот
+      проект не пользуется. Список разрешений в APK обязан быть пустым,
+      поэтому узел явно вырезается при слиянии манифестов.
+    -->
+    <permission
+        android:name="${applicationId}.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
+        tools:node="remove" />
+    <uses-permission
+        android:name="${applicationId}.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
+        tools:node="remove" />
 
     <application
         android:allowBackup="false"
@@ -38,7 +53,7 @@
           Движок живёт в ОТДЕЛЬНОМ процессе.
           Клавиатура не имеет права умирать: если IME убьют по OOM,
           пользователь останется без ввода во всей системе.
-          Модель на ~700 МБ RSS сидит здесь; убили этот процесс --
+          Модель на ~700 МБ RSS сидит здесь; убили этот процесс —
           строка просто погасла, клавиатура продолжает работать.
         -->
         <service
@@ -56,14 +71,11 @@
         </activity>
 
         <!--
-          Замер латентности на устройстве. Запуск:
-            adb shell am start -n dev.souchastnik/.engine.BenchActivity
-            adb logcat -s souchastnik-bench:I souchastnik-native:I
+          BenchActivity объявлена в app/src/debug/AndroidManifest.xml и в
+          релизный APK не попадает. Она exported (иначе `am start` из adb её
+          не поднимет), а exported-активити может дёрнуть любое установленное
+          приложение — в релизе это лишняя дверь к загрузке модели.
         -->
-        <activity
-            android:name=".engine.BenchActivity"
-            android:exported="true"
-            android:label="Bench" />
 
     </application>
 </manifest>

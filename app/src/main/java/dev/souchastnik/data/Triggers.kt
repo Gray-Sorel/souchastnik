@@ -21,7 +21,15 @@ import org.json.JSONObject
  */
 object Triggers {
 
-    private class Group(val words: List<String>, val codes: List<String>)
+    private class Group(
+        val words: List<String>,
+        val codes: List<String>,
+        /** Чистая фраза в той же лексике — контрпример для промпта. */
+        val clean: String?,
+    )
+
+    /** Что сказал словарь: кандидаты и контрпримеры сработавших групп. */
+    class Match(val codes: List<String>, val clean: List<String>)
 
     private var groups: List<Group> = emptyList()
 
@@ -38,7 +46,7 @@ object Triggers {
             val codes = o.getJSONArray("codes").let { c ->
                 (0 until c.length()).map { c.getString(it) }
             }
-            out += Group(words, codes)
+            out += Group(words, codes, o.optString("clean").ifEmpty { null })
         }
         groups = out
     }
@@ -50,21 +58,21 @@ object Triggers {
         s.lowercase().replace('ё', 'е').replace(Regex("\\s+"), " ")
 
     /**
-     * Индексы меток-кандидатов для нативной части: пустой массив означает
-     * «ни один триггер не сработал», и модель запускать не надо.
+     * Кандидаты словаря: пустой список кодов означает «ни один триггер не
+     * сработал», и модель запускать не надо.
      *
-     * Индекс 0 («чисто») в результат не входит — нативная часть добавляет
-     * его сама, иначе модели было бы некуда ответить «состава нет».
+     * "none" в результат не входит — его добавляет вызывающая сторона,
+     * иначе модели было бы некуда ответить «состава нет».
      */
-    fun candidates(text: String): IntArray {
+    fun match(text: String): Match {
         val t = normalize(text)
-        val indices = LinkedHashSet<Int>()
+        val codes = LinkedHashSet<String>()
+        val clean = ArrayList<String>()
         for (g in groups) {
             if (g.words.none { it in t }) continue
-            for (code in g.codes) {
-                Articles.indexOf(code)?.let { indices += it }
-            }
+            g.clean?.let { clean += it }
+            codes += g.codes
         }
-        return indices.toIntArray()
+        return Match(codes.toList(), clean)
     }
 }

@@ -4,12 +4,22 @@ import android.content.Context
 import org.json.JSONObject
 
 /**
- * Справочник статей. Единственный источник правды и для показа в строке,
- * и для набора меток, которыми отвечает модель.
+ * Справочник статей. Единственный источник правды для строки над клавишами
+ * и для таблицы кандидатов в промпте судьи.
  *
  * Сроки и штрафы берутся ОТСЮДА, а не из генерации. Модель 0.8B будет
  * уверенно писать "до 4 лет" там, где в кодексе штраф, и вся шутка
  * ломается: читатель уже не понимает, где прикол, а где косяк приложения.
+ *
+ * ПОЧЕМУ ЗДЕСЬ НЕТ ПОЛЯ label. В articles.json у каждой статьи есть
+ * однотокенная метка, а рядом лежит `_none_label`. Приложение их не читает:
+ * судья отвечает КОДОМ статьи, а мост берёт argmax только по токенам живых
+ * вариантов (см. llama_bridge.cpp, раздел «ПОЧЕМУ НЕ ОДНОТОКЕННЫЕ МЕТКИ»).
+ * Из файла поля не убраны, потому что на них держатся десктопные
+ * инструменты: `tools/try.py` читает `_none_label` в `__init__` в любом
+ * режиме, `tools/bench_variants.py` строит на метках вариант «все статьи в
+ * фиксированном промпте», и на них же весь `train/`. Не добавляйте label
+ * сюда обратно, решив, что парсер без него неполный.
  */
 data class Article(
     val code: String,
@@ -17,13 +27,6 @@ data class Article(
     val title: String,
     val penalty: String,
     val severity: Int,
-    /**
-     * Однотокенная метка, которой модель обозначает эту статью.
-     * Метка задана в articles.json ЯВНО и менять её нельзя: обученная
-     * LoRA знает конкретный символ, и переназначение меток при
-     * переупорядочивании файла молча сломало бы все предсказания.
-     */
-    val label: Char,
 ) {
     /** "ст. 5.61 КоАП · оскорбление · 3–5 тыс ₽" */
     fun strip(): String = "ст. $code $act · $title · $penalty"
@@ -35,19 +38,18 @@ object Articles {
 
     private var list: List<Article> = emptyList()
     private var byCode: Map<String, Article> = emptyMap()
-    private var noneLabel: Char = 'A'
 
-    /** Системный промпт лежит в assets и читается ещё и обучающим скриптом. */
-    var systemPrompt: String = ""
-        private set
+    /** Куда в judge.txt подставляется таблица статей-кандидатов. */
+    private const val TABLE_MARK = "@@TABLE@@"
+
+    /** Шаблон системного сообщения судьи с [TABLE_MARK] вместо таблицы. */
+    private var judgeTemplate: String = ""
 
     fun load(ctx: Context) {
         if (list.isNotEmpty()) return
 
         val json = ctx.assets.open("articles.json").bufferedReader().use { it.readText() }
         val root = JSONObject(json)
-        noneLabel = root.getString("_none_label")[0]
-
         val arr = root.getJSONArray("articles")
         val items = ArrayList<Article>(arr.length())
         for (i in 0 until arr.length()) {
@@ -58,45 +60,41 @@ object Articles {
                 title = o.getString("title"),
                 penalty = o.getString("penalty"),
                 severity = o.getInt("severity"),
-                label = o.getString("label")[0],
             )
         }
         list = items
         byCode = items.associateBy { it.code }
 
-        systemPrompt = ctx.assets.open("prompt.txt").bufferedReader().use { it.readText() }
+        Examples.load(ctx)
+        judgeTemplate = asset(ctx, "judge.txt")
     }
 
     operator fun get(code: String): Article? = byCode[code]
 
     fun size(): Int = list.size
 
+    private fun asset(ctx: Context, name: String): String =
+        ctx.assets.open(name).bufferedReader().use { it.readText() }
+
     /**
-     * Алфавит меток в порядке индексов: нулевая — "чисто", дальше статьи
-     * в порядке файла. Именно эту строку получает нативная часть, и индекс
-     * в ней и есть ответ модели.
+     * Системное сообщение судьи: инструкции плюс таблица ТОЛЬКО тех статей,
+     * которые подняли триггеры, плюс примеры. Весь справочник в промпт не
+     * идёт — при выборе из 82 модель путает близкие составы (20.3.1 с
+     * 20.3.3, 280 с 280.1), при выборе из нескольких кандидатов почти не
+     * путает.
      *
-     * Почему метки, а не сами коды статей под GBNF-грамматикой: замер
-     * показал, что грамматический сэмплер обходит весь словарь на
-     * 248 320 токенов на каждом шаге и стоит сотни миллисекунд на токен.
-     * С однотокенной меткой нужен один шаг декода и argmax по 83
-     * значениям — микросекунды.
+     * Это единственный запрос к модели на разбор. Отдельной калитки «есть
+     * состав?» перед судьёй нет: замер на 66 фразах (tools/bench_variants.py)
+     * показал, что она удваивает префилл и не меняет точность.
+     *
+     * Поле hint из articles.json сюда НЕ попадает: на замерах оно не дало
+     * эффекта, а каждая строка подсказки — это токены префилла.
      */
-    fun labels(): String = buildString {
-        append(noneLabel)
-        list.forEach { append(it.label) }
+    fun judgeSystem(codes: List<String>, groupClean: List<String>): String {
+        val table = codes.asSequence()
+            .mapNotNull { byCode[it] }
+            .joinToString(separator = "\n") { "${it.code} ${it.act} — ${it.title}" }
+        return judgeTemplate.replace(TABLE_MARK, table) +
+            Examples.judgeBlock(codes, groupClean)
     }
-
-    /**
-     * Индекс метки статьи для нативной части. Нумерация та же, что в
-     * [labels]: 0 -- "чисто", статьи с 1.
-     */
-    fun indexOf(code: String): Int? {
-        val i = list.indexOfFirst { it.code == code }
-        return if (i < 0) null else i + 1
-    }
-
-    /** null означает "чисто" (индекс 0) либо мусорный индекс. */
-    fun byIndex(index: Int): Article? =
-        if (index <= 0 || index > list.size) null else list[index - 1]
 }

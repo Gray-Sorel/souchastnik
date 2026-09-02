@@ -29,6 +29,12 @@ class EngineService : Service() {
          */
         fun modelFile(ctx: android.content.Context): File =
             File(ctx.applicationInfo.nativeLibraryDir, LlamaBridge.MODEL_LIB)
+
+        /** Коды ответа [IEngine.load], описаны в IEngine.aidl. */
+        const val LOAD_OK = 0
+        const val LOAD_NO_MODEL = 1
+        const val LOAD_UNSUPPORTED_CPU = 2
+        const val LOAD_INIT_FAILED = 3
     }
 
     // Один поток: генерации строго по одной. Параллелить нечего — модель
@@ -40,25 +46,29 @@ class EngineService : Service() {
 
     private val binder = object : IEngine.Stub() {
 
-        override fun load(): Boolean {
-            if (handle != 0L) return true
+        override fun load(): Int {
+            if (handle != 0L) return LOAD_OK
             val model = modelFile(this@EngineService)
             if (!model.exists()) {
                 Log.w(TAG, "модель не установлена: ${model.absolutePath}")
-                return false
+                return LOAD_NO_MODEL
+            }
+            // ДО первого обращения к LlamaBridge: его init{} грузит
+            // libsouchastnik.so со всеми зависимостями, а libggml-cpu собрана
+            // под dotprod+fp16 и на старом ядре может упасть по SIGILL уже
+            // при загрузке. Падение процесса :engine клавиатуру не убьёт, но
+            // строка навсегда останется в «…» без объяснений.
+            if (!Cpu.supported()) {
+                Log.w(TAG, "процессор без dotprod/fp16, модель не запускаем")
+                return LOAD_UNSUPPORTED_CPU
             }
             Articles.load(this@EngineService)
             Triggers.load(this@EngineService)
 
             val t0 = System.currentTimeMillis()
-            handle = LlamaBridge.init(
-                model.absolutePath,
-                Articles.labels(),
-                Articles.systemPrompt,
-                threadCount(),
-            )
+            handle = LlamaBridge.init(model.absolutePath, Cpu.threadCount())
             Log.i(TAG, "load: handle=$handle за ${System.currentTimeMillis() - t0} мс")
-            return handle != 0L
+            return if (handle != 0L) LOAD_OK else LOAD_INIT_FAILED
         }
 
         override fun unload() {
@@ -78,38 +88,45 @@ class EngineService : Service() {
             if (handle != 0L) LlamaBridge.cancel(handle)
 
             worker.execute {
-                if (latestRequest.get() != requestId) return@worker  // устарел, пока ждал очереди
+                if (latestRequest.get() != requestId) return@execute  // устарел, пока ждал очереди
                 val h = handle
                 if (h == 0L) {
                     safe { cb.onError(requestId, "not_loaded") }
-                    return@worker
+                    return@execute
                 }
                 // Словарь триггеров -- ДО модели. Молчат триггеры -- значит
                 // в тексте нет ни одного слова, за которое хоть что-то
                 // прилетает, и полгига модели крутить незачем.
-                val candidates = Triggers.candidates(text)
-                if (candidates.isEmpty()) {
+                val hit = Triggers.match(text)
+                if (hit.codes.isEmpty()) {
                     safe { cb.onVerdict(requestId, Articles.NONE, 0) }
-                    return@worker
+                    return@execute
                 }
 
                 val t0 = System.currentTimeMillis()
+
+                // Судья: в промпте таблица кандидатов и примеры, в ответе код
+                // статьи целиком либо "none". Калитки «есть состав?» перед ним
+                // больше нет: на 66 контрольных фразах она стоила ~500 токенов
+                // префилла (больше половины всего времени разбора) и меняла
+                // итог на две фразы в одну сторону и две в другую.
+                val alts = (listOf(Articles.NONE) + hit.codes).toTypedArray()
                 val index = try {
-                    LlamaBridge.analyze(h, text, candidates)
+                    val system = Articles.judgeSystem(hit.codes, hit.clean)
+                    LlamaBridge.decide(h, system, text, alts, LlamaBridge.NONE_BIAS, null)
                 } catch (t: Throwable) {
-                    Log.e(TAG, "analyze упал", t)
-                    LlamaBridge.INDEX_ERROR
+                    Log.e(TAG, "разбор упал", t)
+                    LlamaBridge.ERROR
                 }
                 val ms = System.currentTimeMillis() - t0
 
-                if (latestRequest.get() != requestId) return@worker  // успел устареть, пока считали
-                if (index == LlamaBridge.INDEX_ERROR) {
+                if (latestRequest.get() != requestId) return@execute  // успел устареть, пока считали
+                if (index == LlamaBridge.ERROR) {
                     safe { cb.onError(requestId, "aborted") }
                 } else {
-                    // Индекс -> код статьи. Справочник загружен в этом же
-                    // процессе, так что за Binder едет уже готовая строка.
-                    val code = Articles.byIndex(index)?.code ?: Articles.NONE
-                    safe { cb.onVerdict(requestId, code, ms) }
+                    // За Binder едет уже готовый код статьи, а не индекс:
+                    // справочник загружен в этом же процессе.
+                    safe { cb.onVerdict(requestId, alts[index], ms) }
                 }
             }
         }
@@ -127,20 +144,6 @@ class EngineService : Service() {
         worker.shutdown()
         super.onDestroy()
     }
-
-    /**
-     * Только большие ядра. Брать все — значит отдать часть работы
-     * энергоэффективным ядрам, которые станут узким горлом, и заодно
-     * подраться с UI-потоком приложения, в котором человек печатает.
-     */
-    private fun threadCount(): Int =
-        Runtime.getRuntime().availableProcessors().let { n ->
-            when {
-                n >= 8 -> 4
-                n >= 4 -> 2
-                else -> 1
-            }
-        }
 
     /** Клиент мог умереть, пока мы считали: DeadObjectException — норма, не ошибка. */
     private inline fun safe(block: () -> Unit) {

@@ -20,11 +20,20 @@ class KeyboardView(context: Context) : View(context) {
     interface Listener {
         fun onChar(c: Char)
         fun onBackspace()
+        fun onBackspaceWord()
         fun onEnter()
         fun onSpace()
     }
 
     var listener: Listener? = null
+
+    private companion object {
+        /** Сколько держать ⌫, прежде чем это станет удалением по словам. */
+        const val HOLD_MS = 350L
+
+        /** Интервал между словами, пока палец не отпустили. */
+        const val REPEAT_MS = 120L
+    }
 
     private enum class Layout { RU, EN, SYM }
 
@@ -68,6 +77,27 @@ class KeyboardView(context: Context) : View(context) {
 
     private var pressed: Pair<Int, Int>? = null
     private val bounds = RectF()
+
+    private val repeat = android.os.Handler(android.os.Looper.getMainLooper())
+
+    /**
+     * Успело ли зажатие ⌫ превратиться в удаление по словам. Если да, то на
+     * ACTION_UP обычный посимвольный бэкспейс уже не отправляем: иначе после
+     * каждого зажатия отгрызался бы лишний символ.
+     */
+    private var repeatingWords = false
+
+    private val deleteWord = object : Runnable {
+        override fun run() {
+            repeatingWords = true
+            listener?.onBackspaceWord()
+            repeat.postDelayed(this, REPEAT_MS)
+        }
+    }
+
+    private fun stopRepeat() {
+        repeat.removeCallbacks(deleteWord)
+    }
 
     private fun rows(): List<List<Key>> {
         val letters = when (layout) {
@@ -164,21 +194,43 @@ class KeyboardView(context: Context) : View(context) {
         if (hit < 0) hit = row.size - 1
 
         when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> {
+            MotionEvent.ACTION_DOWN -> {
                 pressed = r to hit
                 invalidate()
+                repeatingWords = false
+                if (row[hit].action == Action.BACKSPACE) {
+                    repeat.postDelayed(deleteWord, HOLD_MS)
+                }
+            }
+            MotionEvent.ACTION_MOVE -> {
+                val now = r to hit
+                if (pressed != now) {
+                    // Палец ушёл с ⌫ на другую клавишу — зажатие больше не в силе.
+                    stopRepeat()
+                    pressed = now
+                    invalidate()
+                }
             }
             MotionEvent.ACTION_UP -> {
                 pressed = null
                 invalidate()
-                fire(row[hit])
+                stopRepeat()
+                if (!(repeatingWords && row[hit].action == Action.BACKSPACE)) {
+                    fire(row[hit])
+                }
             }
             MotionEvent.ACTION_CANCEL -> {
                 pressed = null
                 invalidate()
+                stopRepeat()
             }
         }
         return true
+    }
+
+    override fun onDetachedFromWindow() {
+        stopRepeat()
+        super.onDetachedFromWindow()
     }
 
     private fun fire(key: Key) {
