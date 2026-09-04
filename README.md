@@ -3,9 +3,9 @@
 Помогает разобраться какой срок вы получите за то что пишете в интернете.
 
 
-<img width="116" height="128" alt="photo_5249203751392845220_y" src="https://github.com/user-attachments/assets/3c5b5409-845e-4954-bb6b-6a612488fd60" />
-<img width="108" height="92" alt="photo_5249203751392845221_y" src="https://github.com/user-attachments/assets/0b24ad33-231d-4a6c-b9b0-fbf2ab90c5b2" />
-<img width="108" height="93" alt="photo_5249203751392845222_y" src="https://github.com/user-attachments/assets/828e34d7-bc58-4828-acae-7b9967e78b49" />
+<img width="348" height="384" alt="photo_5249203751392845220_y" src="https://github.com/user-attachments/assets/3c5b5409-845e-4954-bb6b-6a612488fd60" />
+<img width="324" height="276" alt="photo_5249203751392845221_y" src="https://github.com/user-attachments/assets/0b24ad33-231d-4a6c-b9b0-fbf2ab90c5b2" />
+<img width="324" height="278" alt="photo_5249203751392845222_y" src="https://github.com/user-attachments/assets/828e34d7-bc58-4828-acae-7b9967e78b49" />
 
 
 Это не юридическая консультация. Настоящий суд смешнее. 
